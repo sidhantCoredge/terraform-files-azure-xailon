@@ -1,0 +1,364 @@
+# ============================================================================
+# Centralized logging — Log Analytics Workspace + diagnostic settings
+#
+# The workspace is the central store for all logs. Firewall, Bastion, AKS and
+# Key Vault send their control-plane logs here; no VM or agent is touched.
+#
+# VM syslog/auth.log (Azure Monitor Agent plus a Data Collection Rule) is NOT in
+# this file — that does touch the VM and comes separately. "Who ran which
+# command" is answered by that, not by this.
+#
+# Note: the workspace endpoint is public, for both ingestion and query. The rest
+# of the infrastructure sits behind private endpoints, so this is an exception.
+# Making it fully private requires an Azure Monitor Private Link Scope (AMPLS),
+# which is deliberately out of scope for now.
+# ============================================================================
+
+resource "azurerm_log_analytics_workspace" "main" {
+  name                = "law-tokenfactory"
+  location            = var.location
+  resource_group_name = azurerm_resource_group.rg.name
+  sku                 = "PerGB2018"
+  retention_in_days   = 30
+
+  tags = {
+    purpose = "centralized-logging"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Azure Firewall — which traffic was allowed or denied
+# ---------------------------------------------------------------------------
+resource "azurerm_monitor_diagnostic_setting" "firewall" {
+  name                       = "diag-firewall-to-law"
+  target_resource_id         = azurerm_firewall.fw.id
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.main.id
+
+  # Categories are listed explicitly ON PURPOSE, rather than using "allLogs".
+  #
+  # The firewall has 16 categories: 3 legacy (AzureFirewall*) and 13 newer
+  # (AZFW*). allLogs turns on both sets, and both record the SAME events — the
+  # same data ingested twice and billed twice. This was observed live:
+  # AZFWApplicationRule 565 vs AzureFirewallApplicationRule 562, and
+  # AZFWDnsQuery 858 vs AzureFirewallDnsProxy 862.
+  #
+  # So only the newer structured-format categories are kept. Deliberately left
+  # out: AZFWIdpsSignature (Premium only), AZFWFatFlow and AZFWFlowTrace (very
+  # verbose, for deep debugging only), and the *Aggregation ones (for Policy
+  # Analytics).
+
+  enabled_log {
+    category = "AZFWApplicationRule" # application rules — which FQDN was allowed or denied
+  }
+
+  enabled_log {
+    category = "AZFWNetworkRule" # network rules
+  }
+
+  enabled_log {
+    category = "AZFWNatRule"
+  }
+
+  enabled_log {
+    category = "AZFWThreatIntel"
+  }
+
+  enabled_log {
+    category = "AZFWDnsQuery" # DNS proxy queries
+  }
+
+  enabled_log {
+    category = "AZFWFqdnResolveFailure" # the most useful one when debugging egress
+  }
+
+  # Azure returns an AllMetrics block of its own (enabled=false). Leaving it out
+  # of the config means every plan shows a "remove the metric block" drift.
+  # Writing it explicitly disabled keeps the plan clean — metrics stay off
+  # either way, so no ingestion is charged.
+  metric {
+    category = "AllMetrics"
+    enabled  = false
+  }
+
+}
+
+# ---------------------------------------------------------------------------
+# Bastion — who connected to which VM and when (BastionAuditLogs)
+# ---------------------------------------------------------------------------
+resource "azurerm_monitor_diagnostic_setting" "bastion" {
+  name                       = "diag-bastion-to-law"
+  target_resource_id         = azurerm_bastion_host.bastion.id
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.main.id
+
+  enabled_log {
+    category_group = "allLogs"
+  }
+
+  # Azure returns an AllMetrics block of its own (enabled=false). Leaving it out
+  # of the config means every plan shows a "remove the metric block" drift.
+  # Writing it explicitly disabled keeps the plan clean — metrics stay off
+  # either way, so no ingestion is charged.
+  metric {
+    category = "AllMetrics"
+    enabled  = false
+  }
+
+}
+
+# ---------------------------------------------------------------------------
+# AKS — categories are listed explicitly ON PURPOSE, not "allLogs".
+#
+# allLogs turns on 13 categories including kube-audit, which logs EVERY API
+# request (reads included) and is by far the largest log source in AKS. Turning
+# on both kube-audit and kube-audit-admin also bills write events twice, because
+# they appear in both.
+#
+# kube-audit-admin alone answers "who changed what".
+# ---------------------------------------------------------------------------
+resource "azurerm_monitor_diagnostic_setting" "aks" {
+  name                       = "diag-aks-to-law"
+  target_resource_id         = azurerm_kubernetes_cluster.aks.id
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.main.id
+
+  enabled_log {
+    category = "kube-audit-admin" # writes only — "who changed what"
+  }
+
+  enabled_log {
+    category = "kube-apiserver"
+  }
+
+  enabled_log {
+    category = "guard" # Entra auth events — useful once Entra is enabled on AKS
+  }
+
+  enabled_log {
+    category = "cluster-autoscaler"
+  }
+
+  # Azure returns an AllMetrics block of its own (enabled=false). Leaving it out
+  # of the config means every plan shows a "remove the metric block" drift.
+  # Writing it explicitly disabled keeps the plan clean — metrics stay off
+  # either way, so no ingestion is charged.
+  metric {
+    category = "AllMetrics"
+    enabled  = false
+  }
+
+}
+
+# ---------------------------------------------------------------------------
+# Key Vault — who read which secret and when (AuditEvent)
+# Low volume, and the most useful of the lot: who accessed pg-admin-password.
+# ---------------------------------------------------------------------------
+resource "azurerm_monitor_diagnostic_setting" "kv" {
+  name                       = "diag-kv-to-law"
+  target_resource_id         = azurerm_key_vault.kv.id
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.main.id
+
+  enabled_log {
+    category = "AuditEvent"
+  }
+
+  # Azure returns an AllMetrics block of its own (enabled=false). Leaving it out
+  # of the config means every plan shows a "remove the metric block" drift.
+  # Writing it explicitly disabled keeps the plan clean — metrics stay off
+  # either way, so no ingestion is charged.
+  metric {
+    category = "AllMetrics"
+    enabled  = false
+  }
+
+}
+
+# Note: "AllMetrics" is deliberately absent everywhere. Platform metrics are
+# already free in Azure Monitor; sending them to Log Analytics incurs an
+# ingestion charge. Alerts and dashboards can be built from the metrics
+# directly.
+
+# ============================================================================
+# Activity Log → workspace
+#
+# "Who changed which resource and when" — Terraform, az CLI or the portal, it
+# all lands here, with the caller's UPN.
+#
+# By default the Activity Log lives only in Azure's own store (90 days) and
+# cannot be queried with KQL. Getting it into the workspace needs this
+# subscription-level diagnostic setting. Volume is low and the cost negligible.
+#
+# Query: AzureActivity | project TimeGenerated, Caller, OperationNameValue
+# ============================================================================
+
+resource "azurerm_monitor_diagnostic_setting" "activity_log" {
+  name                       = "diag-activitylog-to-law"
+  target_resource_id         = "/subscriptions/${data.azurerm_client_config.current.subscription_id}"
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.main.id
+
+  enabled_log {
+    category = "Administrative" # create/update/delete — everything Terraform does
+  }
+
+  enabled_log {
+    category = "Security"
+  }
+
+  enabled_log {
+    category = "Policy"
+  }
+
+  enabled_log {
+    category = "ServiceHealth"
+  }
+  # NOTE: there is deliberately no metric block here. A subscription-level
+  # Activity Log diagnostic setting has no metrics at all — Azure does not store
+  # one if written, and every plan then shows a drift.
+
+}
+
+# ============================================================================
+# Azure Monitor Agent + Data Collection Rule — the jumphost's OS logs
+#
+# This answers two questions that are currently logged nowhere:
+#   1. Who signed in to the jumphost, by SSH or Entra  -> auth/authpriv facility
+#   2. Who ran which command                            -> local6, from auditd
+#
+# The real benefit: the logs leave the VM. Today auth.log sits on the VM itself,
+# rotates away in about four weeks, and anyone with sudo can edit it. Once it is
+# in the workspace the record survives whatever happens on the VM.
+#
+# AMA needs a managed identity on the VM, and one already exists (added in
+# jumphost.tf for AADSSHLoginForLinux), so nothing new is required.
+#
+# NOTE: the local6 facility only works once auditd and the audisp-syslog bridge
+# are set up on the VM. auditd writes to /var/log/audit/audit.log, which is NOT
+# syslog — without the bridge the DCR receives nothing. Those commands are
+# documented separately and have to be run on the VM.
+# ============================================================================
+
+resource "azurerm_virtual_machine_extension" "ama_linux" {
+  name                       = "AzureMonitorLinuxAgent"
+  virtual_machine_id         = azurerm_linux_virtual_machine.jumphost.id
+  publisher                  = "Microsoft.Azure.Monitor"
+  type                       = "AzureMonitorLinuxAgent"
+  type_handler_version       = "1.33"
+  auto_upgrade_minor_version = true
+}
+
+resource "azurerm_monitor_data_collection_rule" "jumphost_syslog" {
+  name                = "dcr-jumphost-syslog"
+  location            = var.location
+  resource_group_name = azurerm_resource_group.rg.name
+  description         = "Jumphost auth/authpriv (logins, sudo) + local6 (auditd commands)"
+
+  destinations {
+    log_analytics {
+      name                  = "law-destination"
+      workspace_resource_id = azurerm_log_analytics_workspace.main.id
+    }
+  }
+
+  data_sources {
+    syslog {
+      name    = "jumphost-auth"
+      streams = ["Microsoft-Syslog"]
+
+      # auth + authpriv : SSH logins, Entra logins, sudo commands
+      # local6          : auditd output, via the audisp-syslog bridge
+      facility_names = ["auth", "authpriv", "local6"]
+
+      log_levels = [
+        "Debug", "Info", "Notice", "Warning",
+        "Error", "Critical", "Alert", "Emergency",
+      ]
+    }
+  }
+
+  data_flow {
+    streams      = ["Microsoft-Syslog"]
+    destinations = ["law-destination"]
+  }
+
+  tags = {
+    purpose = "centralized-logging"
+  }
+}
+
+resource "azurerm_monitor_data_collection_rule_association" "jumphost_syslog" {
+  name                    = "dcra-jumphost-syslog"
+  target_resource_id      = azurerm_linux_virtual_machine.jumphost.id
+  data_collection_rule_id = azurerm_monitor_data_collection_rule.jumphost_syslog.id
+  description             = "Associates the jumphost with the syslog DCR"
+}
+
+# ---------------------------------------------------------------------------
+# PostgreSQL Flexible Server — who connected, and which queries failed
+#
+# All the business data lives here (tokenfactory, keycloak, openmeter, svix,
+# openfga) and until now none of it was logged.
+#
+# log_connections and log_disconnections are already "on" by default on Azure
+# and are dynamic — no server parameter change and no restart needed.
+#
+# Only PostgreSQLLogs is enabled. The QueryStore categories (Runtime, WaitStats,
+# SqlText) are for performance tuning, carry much higher volume, and require
+# Query Store to be enabled — add them if and when they are needed.
+# ---------------------------------------------------------------------------
+resource "azurerm_monitor_diagnostic_setting" "postgres" {
+  name                       = "diag-postgres-to-law"
+  target_resource_id         = azurerm_postgresql_flexible_server.pg.id
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.main.id
+
+  enabled_log {
+    category = "PostgreSQLLogs"
+  }
+
+  metric {
+    category = "AllMetrics"
+    enabled  = false
+  }
+}
+
+# ---------------------------------------------------------------------------
+# tfstate storage account — who read, wrote or deleted the state blob
+#
+# The state file holds the PostgreSQL admin password in plaintext, and until now
+# there was no record of access to it: anyone with Contributor could pull the
+# account key with listKeys, read the state, and leave no trace.
+#
+# Note: the diagnostic setting attaches to the account's blobServices
+# sub-resource, not to the account itself — hence the "/blobServices/default"
+# suffix on target_resource_id.
+#
+# Low volume (the state is read a handful of times a day), highest sensitivity.
+# ---------------------------------------------------------------------------
+resource "azurerm_monitor_diagnostic_setting" "tfstate_blob" {
+  name                       = "diag-tfstate-blob-to-law"
+  target_resource_id         = "${azurerm_storage_account.tfstate.id}/blobServices/default"
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.main.id
+
+  enabled_log {
+    category = "StorageRead"
+  }
+
+  enabled_log {
+    category = "StorageWrite"
+  }
+
+  enabled_log {
+    category = "StorageDelete"
+  }
+
+  # Storage blobServices has no "AllMetrics" category at all — its categories are
+  # Capacity and Transaction. Writing AllMetrics produces a drift on every plan
+  # (Azure returns those two, Terraform asks for AllMetrics).
+  # Both explicitly disabled — metrics are free in Azure Monitor.
+  metric {
+    category = "Capacity"
+    enabled  = false
+  }
+
+  metric {
+    category = "Transaction"
+    enabled  = false
+  }
+}

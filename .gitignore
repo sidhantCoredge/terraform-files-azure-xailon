@@ -1,0 +1,21 @@
+# Terraform working dir & plugin cache (platform-specific, ~866 MB)
+.terraform/
+*.tfplan
+
+# State lives in the azurerm remote backend (sttokenfactorytfstate001) — never commit it
+*.tfstate
+*.tfstate.*
+
+# Keys / certs / credentials
+*.pem
+*.p12
+*.csr
+*.key
+*.srl
+cert-base64.txt
+jumphost_azure_login.txt
+
+# Local scratch copies
+*.bak
+*.bkptf
+*.pre-*
