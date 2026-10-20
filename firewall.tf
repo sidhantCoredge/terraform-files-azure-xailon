@@ -381,6 +381,104 @@ resource "azurerm_firewall_policy_rule_collection_group" "aks_bootstrap" {
     }
   }
 
+  # Upstream model inference — TokenFactory's own OpenAI-compatible API.
+  #
+  # Xailon does NOT call the model services directly. Those run in the baremetal
+  # production cluster and are only addressable there, as cluster-local names
+  # such as gemma-4-31b-it-agg-h200-frontend.vllm.svc.cluster.local:8000, which
+  # resolve nowhere outside that cluster.
+  #
+  # Instead TokenFactory is onboarded as a single upstream PROVIDER. One
+  # endpoint serves the whole catalogue, so onboarding a new model needs no
+  # firewall change and no model is ever exposed to the internet individually.
+  #
+  # An FQDN rule, not the Cloudflare IP ranges: those 15 CIDRs are Cloudflare's
+  # entire public edge (~1.5M addresses fronting a large share of the web), so
+  # allowing them would let these pods reach any Cloudflare-hosted site. Azure
+  # Firewall matches HTTPS application rules on SNI, so the hostname is enough
+  # and no TLS inspection is required.
+  application_rule_collection {
+    name     = "aks-model-upstream"
+    priority = 112
+    action   = "Allow"
+
+    rule {
+      name = "allow-tokenfactory-api"
+
+      protocols {
+        type = "Https"
+        port = 443
+      }
+
+      source_addresses  = ["10.40.8.0/21"] # snet-aks
+      destination_fqdns = ["api.tokenfactory.iamsaif.ai"]
+    }
+  }
+
+  # Package installs for the collector VMs and the jumphost.
+  #
+  # kcat (Kafka CLI, used to prove the Event Hub Kafka endpoint on 9093) and
+  # keepalived both come from the standard Ubuntu pockets. azure.archive is the
+  # mirror the Azure Ubuntu images point at by default; archive/security are the
+  # upstream fallbacks apt uses when the Azure mirror misses a pocket.
+  #
+  # Port 80 as well as 443: apt still fetches from the http:// sources listed in
+  # /etc/apt/sources.list on these images, and an HTTPS-only rule silently
+  # breaks `apt update` with a hash-sum failure rather than a clean denial.
+  #
+  # NOTE FOR snet-collector: this rule alone does NOT give the collectors
+  # internet access. rt-collector blackholes 0.0.0.0/0 (next_hop_type = "None")
+  # and nsg-collector denies VirtualNetwork outbound at priority 200, so their
+  # traffic never reaches the firewall to be matched here. Both need changing
+  # too — see the comment on azurerm_route_table.collector in collector.tf,
+  # which anticipated exactly this ("add a firewall route and a named
+  # application rule rather than opening this"). Until then this collection is
+  # live only for the jumphost.
+  application_rule_collection {
+    name     = "collector-package-installs"
+    priority = 113
+    action   = "Allow"
+
+    rule {
+      name = "allow-ubuntu-apt-collector"
+
+      protocols {
+        type = "Http"
+        port = 80
+      }
+      protocols {
+        type = "Https"
+        port = 443
+      }
+
+      source_addresses = ["10.40.5.0/28", "10.40.1.0/27"] # snet-collector, snet-mgmt
+      destination_fqdns = [
+        "azure.archive.ubuntu.com",
+        "archive.ubuntu.com",
+        "security.ubuntu.com",
+        "changelogs.ubuntu.com",
+        "ports.ubuntu.com"
+      ]
+    }
+
+    # Cribl's package and licence endpoints. A wildcard rather than a fixed
+    # host list: downloads come off cdn.cribl.io, the installer also calls the
+    # main site, and Cribl moves these between subdomains without notice.
+    # Azure Firewall matches HTTPS application rules on SNI, so the hostname is
+    # enough and no TLS inspection is needed.
+    rule {
+      name = "allow-cribl"
+
+      protocols {
+        type = "Https"
+        port = 443
+      }
+
+      source_addresses  = ["10.40.5.0/28", "10.40.1.0/27"]
+      destination_fqdns = ["cribl.io", "*.cribl.io"]
+    }
+  }
+
   # Cloudflare Tunnel (cloudflared) — outbound only.
   #
   # cloudflared connects to Cloudflare's edge on port 7844, not 443:

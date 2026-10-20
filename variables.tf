@@ -111,3 +111,65 @@ variable "dnsr_inbound_ip" {
   type        = string
   default     = "10.40.4.4"
 }
+
+# ── Site-to-Site VPN ────────────────────────────────────────────────────────
+variable "s2s_remote_primary_ip" {
+  type        = string
+  default     = "74.162.206.233"
+  description = "Public IP of the remote site's primary VPN endpoint"
+}
+
+variable "s2s_remote_secondary_ip" {
+  type        = string
+  default     = "20.233.207.64"
+  description = "Public IP of the remote site's secondary VPN endpoint (not yet connected)"
+}
+
+variable "s2s_remote_address_space" {
+  type        = list(string)
+  default     = ["10.23.3.0/26"]
+  description = "Address space behind the remote VPN endpoint"
+}
+
+# ── Partner collector VMs ───────────────────────────────────────────────────
+variable "collector_subnet_prefix" {
+  type        = list(string)
+  default     = ["10.40.5.0/28"]
+  description = "Dedicated subnet for the partner collector VMs (verified free 15 Oct 2026)"
+}
+
+variable "collector_vip_address" {
+  type        = string
+  default     = "10.40.5.4"
+  description = "Static frontend address of the collector load balancer; .0-.3 are Azure-reserved"
+}
+
+variable "collector_vm_size" {
+  type        = string
+  default     = "Standard_D8als_v7"
+  description = "8 vCPU / 16 GB, unrestricted in UAE North across zones 1-2-3"
+}
+
+variable "collector_image_version" {
+  type        = string
+  default     = "24.04.202510010"
+  description = "Ubuntu 24.04 LTS image version, pinned rather than latest for reproducible builds"
+}
+
+variable "collector_ssh_public_key_path" {
+  type        = string
+  default     = "~/.ssh/id_rsa_jumphost.pub"
+  description = "Path to the SSH public key for the collector VMs' azureuser account. Defaults to the same key as the jumphost, which means one key opens both; use a separate key if the collectors should have their own blast radius."
+}
+
+variable "collector_probe_port" {
+  type        = string
+  default     = "22"
+  description = "TCP port the load balancer probes to decide a collector is healthy. 22 answers 'the VM is alive'; change it to the collector service port for a real health check."
+}
+
+variable "eventhub_private_endpoint_ip" {
+  type        = string
+  default     = "10.40.3.7/32"
+  description = "Private endpoint address of ehns-tokenfactory, the single destination the collector subnet may reach for the SOC log feed"
+}

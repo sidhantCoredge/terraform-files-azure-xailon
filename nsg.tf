@@ -96,6 +96,26 @@ resource "azurerm_network_security_group" "pe" {
     destination_address_prefix = "*"
   }
 
+  # The collector VMs consume the SOC diagnostics hub over the Event Hubs
+  # private endpoint. snet-pe has privateEndpointNetworkPolicies Enabled, so
+  # this NSG is enforced on traffic arriving at the endpoints and the collectors
+  # would otherwise fall through to Deny-VNet-Inbound at 4096.
+  #
+  # Scoped to the Event Hubs endpoint ADDRESS, not the whole subnet: the Key
+  # Vault, ACR, Postgres, Redis and blob endpoints live in snet-pe too and the
+  # partner must not reach any of them.
+  security_rule {
+    name                       = "Allow-Collector-To-EventHub-PE"
+    priority                   = 120
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_ranges    = ["443", "5671", "9093"]
+    source_address_prefix      = "10.40.5.0/28" # snet-collector
+    destination_address_prefix = "10.40.3.7/32" # pe-eventhub
+  }
+
   tags = {
     nsg = "tokenfactory"
   }

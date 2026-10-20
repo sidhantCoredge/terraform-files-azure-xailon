@@ -5,6 +5,15 @@ resource "azurerm_eventhub_namespace" "ehns" {
   sku                 = "Standard"
   capacity            = 1
 
+  # Auto-inflate added when the SOC log feed landed on this namespace. Firewall
+  # and AKS api-server diagnostics are high volume and share the single
+  # throughput unit with metering; without this a log burst would throttle
+  # OpenMeter, which carries billing data. Inflating costs money rather than
+  # dropping events, which is the right trade for billing data but is a real
+  # cost exposure driven by log volume.
+  auto_inflate_enabled     = true
+  maximum_throughput_units = 5
+
   # The Kafka protocol is only supported from the Standard tier upwards
   public_network_access_enabled = false
 
