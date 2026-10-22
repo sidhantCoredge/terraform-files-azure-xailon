@@ -17,6 +17,21 @@ resource "azurerm_eventhub_namespace" "ehns" {
   # The Kafka protocol is only supported from the Standard tier upwards
   public_network_access_enabled = false
 
+  # `capacity` is the STARTING throughput unit count, not the running one.
+  # auto_inflate_enabled hands ownership of it to the service: under load Azure
+  # raises it on its own, and on 20 Oct 2026 it was sitting at the ceiling of 5.
+  # Terraform reads that back as drift against the 1 above and plans
+  # `capacity = 5 -> 1` on every run, which would cut throughput five-fold on
+  # the namespace carrying BOTH OpenMeter billing events and the partner SOC
+  # feed — the same namespace that logged 4,495 ThrottledRequests at 1 TU.
+  #
+  # Ignoring it keeps 1 as the floor a fresh install starts from while leaving
+  # the live value to auto-inflate. The ceiling is still enforced by
+  # maximum_throughput_units, so cost stays bounded.
+  lifecycle {
+    ignore_changes = [capacity]
+  }
+
   tags = {
     eh = "tokenfactory"
   }

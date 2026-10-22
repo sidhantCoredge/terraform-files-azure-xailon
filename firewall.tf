@@ -155,8 +155,21 @@ resource "azurerm_firewall_policy_rule_collection_group" "aks_bootstrap" {
   # The ods.opinsights endpoint is workspace-specific (the workspace ID is the
   # hostname), so it is a wildcard here — changing the workspace will not break
   # the rule.
+  # Sources: the jumphost AND snet-aks. AKS was added on 21 Oct 2026 when
+  # Container Insights was enabled — the ama-logs DaemonSet is the same Azure
+  # Monitor Agent and needs the same control-plane endpoints to download its
+  # Data Collection Rule. Without them the agent starts, reports healthy, and
+  # logs:
+  #
+  #   config::error::Exception while parsing dcr : No JSON file found in the
+  #   specified directory. Check if mdsd is running in MSI mode.
+  #
+  # then collects nothing. The failure is silent at every other level: pods are
+  # 3/3 Running, the add-on reports enabled, and the Data Export rule reports
+  # Enabled — but no rows reach the workspace, so no batch is ever exported and
+  # the am-ContainerLogV2 hub is never created.
   application_rule_collection {
-    name     = "jumphost-azure-monitor-agent"
+    name     = "azure-monitor-agent"
     priority = 105
     action   = "Allow"
 
@@ -168,92 +181,17 @@ resource "azurerm_firewall_policy_rule_collection_group" "aks_bootstrap" {
         port = 443
       }
 
-      source_addresses = ["10.40.1.0/27"]
+      source_addresses = ["10.40.1.0/27", "10.40.8.0/21"] # snet-mgmt, snet-aks
       destination_fqdns = [
         "global.handler.control.monitor.azure.com",
         "uaenorth.handler.control.monitor.azure.com",
         "*.ods.opinsights.azure.com",
         "*.oms.opinsights.azure.com",
         "*.monitoring.azure.com",
-      ]
-    }
-  }
-
-  # For pulling container images from the AKS subnet.
-  #
-  # NOTE: these rules are NOT required when images are brought into ACR with
-  # `az acr import` — that import runs inside ACR's own service, never traverses
-  # this firewall, and AKS then pulls from ACR over a private endpoint. This
-  # collection only matters when AKS pulls directly from a public registry.
-  application_rule_collection {
-    name     = "aks-container-registries"
-    priority = 106
-    action   = "Allow"
-
-    rule {
-      name = "allow-image-pull"
-
-      protocols {
-        type = "Https"
-        port = 443
-      }
-
-      source_addresses = ["10.40.8.0/21"]
-      destination_fqdns = [
-        "ghcr.io",
-        "pkg-containers.githubusercontent.com", # ghcr ka blob backend
-        "*.githubusercontent.com",
-      ]
-    }
-  }
-
-  # Docker Hub — for the three initContainer images that cannot come from ACR.
-  #
-  # These three are HARDCODED in the chart templates, so they never go through
-  # `common.images.image` and the `global.imageRegistry` ACR prefix never
-  # applies to them:
-  #
-  #   busybox:1.36                   minio's fix-data-ownership init
-  #   busybox:1.36@sha256:73aaf09…   tf-auth's wait-for-migrate init
-  #   curlimages/curl:8.11.1         tf-ledger's geoip-fetch init
-  #
-  # The minio and tf-ledger ones can be overridden from values
-  # (initContainers.chownImage / geoip.fetchImage), but tf-auth's is fully
-  # hardcoded, digest included, with no knob at all. So the path has to be
-  # opened.
-  #
-  # A Docker Hub pull touches three separate hosts:
-  #   registry-1.docker.io              registry API (manifest)
-  #   auth.docker.io                    anonymous pull token
-  #   production.cloudflare.docker.com  layer blobs (CDN)
-  # All three are needed. Opening only registry-1 gets the manifest but the
-  # layers stall, and the pod sits in "ImagePullBackOff" with no clear reason.
-  application_rule_collection {
-    name     = "aks-dockerhub-init-images"
-    priority = 110
-    action   = "Allow"
-
-    rule {
-      name = "allow-dockerhub-pull"
-
-      protocols {
-        type = "Https"
-        port = 443
-      }
-
-      source_addresses = ["10.40.8.0/21"]
-      destination_fqdns = [
-        "registry-1.docker.io",
-        "auth.docker.io",
-        "index.docker.io",
-        # Docker Hub serves blobs from TWO backends — Cloudflare OR AWS
-        # CloudFront, depending on routing. Only the Cloudflare one was open, and
-        # uaenorth was routed to CloudFront, so the manifest arrived but the layer
-        # download failed with `EOF`:
-        #   Get "https://production.cloudfront.docker.com/registry-v2/.../blobs/..." : EOF
-        # (seen live on openmeter-redis-master-0, pulling bitnamilegacy/redis).
-        "production.cloudflare.docker.com",
-        "production.cloudfront.docker.com",
+        # DCR-based ingestion endpoint. Required by the AKS agent, which runs
+        # with msi_auth_for_monitoring_enabled = true and so ingests through a
+        # Data Collection Endpoint rather than the legacy ODS path.
+        "*.ingest.monitor.azure.com",
       ]
     }
   }
@@ -305,11 +243,43 @@ resource "azurerm_firewall_policy_rule_collection_group" "aks_bootstrap" {
         # repeated here for the jumphost.)
         "ghcr.io",
         "pkg-containers.githubusercontent.com",
-        "registry-1.docker.io",
-        "auth.docker.io",
-        "index.docker.io",
-        "production.cloudflare.docker.com",
-        "production.cloudfront.docker.com",
+
+        # ── Docker Hub — BLOCKED on purpose (22 Oct 2026) ──────────────────
+        # TO RE-ENABLE DOCKER HUB, UNCOMMENT THE FIVE LINES BELOW.
+        # All five are needed together: registry-1 serves the manifest,
+        # auth issues the anonymous pull token, and the two production.*
+        # hosts serve the layer blobs. Uncommenting only some of them gets
+        # the manifest and then stalls on the layers, which surfaces as
+        # ImagePullBackOff with no useful reason given.
+        #
+        # Closed because nothing needs to PULL right now: the images are
+        # already cached on the nodes and the running pods are unaffected.
+        # It is not risk-free. At the time of closing, 87 running containers
+        # came from Docker Hub, including the ones that carry public traffic:
+        #
+        #   docker.io/envoyproxy/gateway + envoy + ai-gateway-extproc
+        #   nginx/nginx-ingress:3.6.2
+        #   busybox:1.37.0 / 1.36      (init containers across the chart)
+        #   svix/svix-server, bitnamilegacy/redis, cloudflared,
+        #   clickhouse, altinity/clickhouse-operator
+        #
+        # So this stays harmless only while no node event forces a re-pull.
+        # A node scale-out, a pod rescheduled onto a node that lacks the
+        # image, or an AKS node-image upgrade will all fail to pull, and the
+        # symptom appears on the workload, not here.
+        #
+        # The durable fix is to bring these images into ACR with
+        # `az acr import` — that runs inside ACR's own service, never
+        # traverses this firewall, and AKS then pulls over the private
+        # endpoint. Note that tf-auth's busybox init image is hardcoded in
+        # the chart by digest with no values override, so the chart has to
+        # change before Docker Hub can be dropped permanently.
+        #
+        # "registry-1.docker.io",
+        # "auth.docker.io",
+        # "index.docker.io",
+        # "production.cloudflare.docker.com",
+        # "production.cloudfront.docker.com",
       ]
     }
 
@@ -328,16 +298,32 @@ resource "azurerm_firewall_policy_rule_collection_group" "aks_bootstrap" {
     }
   }
 
+  # Reconciled against the deployed chart and the running workloads on
+  # 22 Oct 2026 (TOKE75R). Every FQDN below was confirmed in use:
   #
-  # !! THIS LIST STILL NEEDS CONFIRMING !!
-  # The FQDNs below are based on which services production uses (Resend, Stripe,
-  # Entra BYOIDC, Google BYOIDC). The real list should be reconciled against the
-  # application's own configuration — a missed endpoint is blocked silently and
-  # surfaces as a timeout in the app, not as anything in the firewall.
+  #   login.microsoftonline.com / graph.microsoft.com
+  #       MICROSOFT_OIDC_CLIENT_ID is set on tf-auth
+  #   accounts.google.com / oauth2.googleapis.com / www.googleapis.com /
+  #   openidconnect.googleapis.com
+  #       GOOGLE_OIDC_CLIENT_ID is set on tf-auth. openidconnect is the
+  #       userinfo endpoint and is NOT named anywhere in the chart — its
+  #       absence is what caused the Google SSO 502, so do not drop it for
+  #       looking unused.
+  #   api.stripe.com / files.stripe.com
+  #       PLATFORM_STRIPE_SECRET_KEY is set on tf-accounts
+  #   api.resend.com
+  #       PLATFORM_RESEND_API_KEY is set on tf-accounts
   #
-  # How to debug it: read the AZFWApplicationRule deny logs. But note that
-  # logging is currently OFF (logging.tf.disabled). Turn it on for the day of a
-  # deployment, otherwise blocked traffic is invisible.
+  # A caution for whoever audits this next: grepping the chart is not a
+  # sufficient test. Runtime SDK endpoints never appear in configuration —
+  # api.stripe.com and api.cloudflare.com both return zero chart hits and are
+  # both demonstrably in use. Removal needs deny-log or workload evidence, not
+  # a failed grep.
+  #
+  # Firewall logging is NO LONGER OFF: diag-firewall-to-soc-hub ships
+  # AZFWApplicationRule denies to the azure-diagnostics event hub. To query
+  # them in KQL rather than from the hub, add a second diagnostic setting
+  # pointing at law-tokenfactory (logging.tf).
   application_rule_collection {
     name     = "aks-app-egress"
     priority = 107
@@ -375,7 +361,7 @@ resource "azurerm_firewall_policy_rule_collection_group" "aks_bootstrap" {
       source_addresses = ["10.40.8.0/21"]
       destination_fqdns = [
         "api.stripe.com",   # payments
-        "files.stripe.com", # Stripe ke hosted assets
+        "files.stripe.com", # Stripe hosted assets
         "api.resend.com",   # transactional email
       ]
     }
@@ -521,6 +507,49 @@ resource "azurerm_firewall_policy_rule_collection_group" "aks_bootstrap" {
   # Optional cloudflared features — self-update and Access JWT validation. The
   # tunnel runs without them (Cloudflare's own documentation says so), but the
   # log fills with errors. These are HTTPS on 443, so an application rule works.
+  # Keycloak's outbound email — SMTP, not HTTPS.
+  #
+  # tf-auth configures Keycloak with KC_SMTP_HOST = smtp.resend.com on port
+  # 465 (helm values.yaml:470, values-tf-prod.yaml:411). That is a different
+  # path from api.resend.com in collection 107: tf-accounts uses the Resend
+  # HTTPS API, Keycloak speaks SMTP. Only the first was allowed, so every
+  # Keycloak email — login OTP, address verification — timed out:
+  #
+  #   ERROR [EmailAuthenticatorForm] Failed to send access code email
+  #   Caused by: MailConnectException: Couldn't connect to host, port:
+  #              smtp.resend.com, 465; timeout 10000
+  #
+  # observed against a real user on 21 Oct 2026, who could not log in.
+  #
+  # This HAS to be a network rule: Azure Firewall application rules handle
+  # HTTP, HTTPS and MSSQL only, and SMTP is none of those.
+  #
+  # ⚠ IP ADDRESSES, NOT AN FQDN, AND THAT IS A COMPROMISE.
+  # FQDNs in network rules require DNS proxy on the firewall policy, which is
+  # off here — turning it on means repointing the VNet's DNS away from the
+  # private resolver at 10.40.4.4 and would put private endpoint resolution at
+  # risk. So the two addresses smtp.resend.com resolved to on 22 Oct 2026 are
+  # pinned instead. They are AWS us-east-1 addresses and Resend publishes no
+  # static IP list, so THEY CAN CHANGE WITHOUT NOTICE.
+  #
+  # The failure mode if they do is silent and identical to the one above:
+  # Keycloak emails time out, nothing appears in the firewall's application
+  # rule logs because this is a network rule, and users cannot log in. Re-check
+  # with `getent hosts smtp.resend.com` if OTP delivery ever stops.
+  network_rule_collection {
+    name     = "aks-smtp-resend"
+    priority = 114
+    action   = "Allow"
+
+    rule {
+      name                  = "allow-keycloak-smtp"
+      protocols             = ["TCP"]
+      source_addresses      = ["10.40.8.0/21"] # snet-aks
+      destination_addresses = ["54.157.71.137/32", "54.205.195.44/32"]
+      destination_ports     = ["465"]
+    }
+  }
+
   application_rule_collection {
     name     = "aks-cloudflare-api"
     priority = 109

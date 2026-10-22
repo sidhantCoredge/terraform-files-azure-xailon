@@ -91,7 +91,7 @@ variable "pg_standby_zone" {
   default = "2"
 }
 variable "azure_platform_dns" {
-  description = "Azure ka reserved internal DNS resolver IP — platform-wide constant"
+  description = "Azure’s reserved internal DNS resolver IP — platform-wide constant"
   default     = "168.63.129.16"
 }
 
@@ -172,4 +172,35 @@ variable "eventhub_private_endpoint_ip" {
   type        = string
   default     = "10.40.3.7/32"
   description = "Private endpoint address of ehns-tokenfactory, the single destination the collector subnet may reach for the SOC log feed"
+}
+
+variable "aks_admin_group_object_id" {
+  type        = string
+  description = "Object ID of the Entra group whose members administer the AKS cluster (aks-tokenfactory-admins). Members receive the Cluster User and RBAC Cluster Admin roles on the cluster, which is how cluster access is granted and revoked — edit the group, not this value."
+}
+
+# ── AKS container logs to the SOC (logging.tf) ──────────────────────────────
+# Defaults to false on purpose. This feature routes application logs through a
+# Log Analytics workspace, which bills per GB ingested on top of Event Hub
+# throughput, and its export rule consumes the last free hub slot on the
+# Standard-tier namespace. It is opted into per environment, never inherited.
+variable "container_log_export_enabled" {
+  type        = bool
+  default     = false
+  description = "Enable Container Insights on AKS and export ContainerLogV2 to Event Hubs for the SOC. Creates a Log Analytics workspace and consumes one event hub slot (am-ContainerLogV2). Billed per GB ingested — see logging.tf."
+}
+
+variable "container_log_retention_days" {
+  type        = number
+  default     = 30
+  description = "Retention for the container-log workspace. 30 is Azure's billable floor; the workspace is a transit buffer to Event Hubs rather than an archive, so there is nothing to gain above it."
+}
+
+# Step 2 of the AMPLS rollout — see monitor_private_link.tf. Leave false until
+# the private endpoint exists and DNS resolves to 10.40.3.x from inside the
+# VNet; flipping it early removes the agent's ingestion path with no fallback.
+variable "monitor_private_only" {
+  type        = bool
+  default     = false
+  description = "Disable public ingestion and query on the Log Analytics workspace. Requires the AMPLS private endpoint to be in place and resolving first."
 }

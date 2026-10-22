@@ -1,0 +1,149 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Azure Monitor Private Link Scope (AMPLS) — law-tokenfactory off the internet
+#
+# WHY
+# Every other data store in this environment sits behind a private endpoint.
+# The Log Analytics workspace was the one exception: its ingestion and query
+# endpoints are public, so a leaked credential would be usable from anywhere
+# rather than only from inside the network. Authentication is unchanged either
+# way — Entra plus RBAC — so this is defence in depth, not a new access
+# control.
+#
+# WHAT IS NOT AFFECTED
+# The partner's collectors never touch the workspace. They consume Event Hub
+# (am-containerlogv2 via 10.40.3.7:9093), and Data Export is a service-to-
+# service push from the workspace to the hub inside Azure. Making the workspace
+# private changes nothing for them: same hub, same connection string, same NSG
+# rules, no new source to configure.
+#
+# ⚠ APPLY THIS IN TWO STEPS — see var.monitor_private_only at the end.
+# Step 1 (this file, with monitor_private_only = false) builds the scope, the
+# private endpoint and the DNS zones while the workspace stays publicly
+# reachable. Nothing breaks; the agent keeps shipping over its existing path.
+# Step 2 flips the workspace to private-only, AFTER the DNS has been confirmed
+# resolving to private IPs. Doing both at once risks the agent losing its
+# ingestion path with no fallback, and this pipeline has already failed
+# silently twice — a healthy-looking agent that collects nothing is the house
+# style of this feature.
+#
+# ⚠ THE ACCESS-MODE TRAP
+# ingestion_access_mode and query_access_mode are left "Open" deliberately.
+# "PrivateOnly" means that FROM THIS VNET, only Azure Monitor resources inside
+# this scope are reachable — every other workspace and Application Insights
+# instance becomes unreachable, silently. There is already a second workspace
+# in this tenant (inifnia-llm-resource-logs, in tokenfactory-preprod). "Open"
+# still routes this workspace's traffic privately; it just does not blanket-ban
+# everything else. Change it only after auditing what else in this VNet talks
+# to Azure Monitor.
+# ─────────────────────────────────────────────────────────────────────────────
+
+resource "azurerm_monitor_private_link_scope" "ampls" {
+  name                = "ampls-tokenfactory"
+  resource_group_name = azurerm_resource_group.rg.name
+
+  # See the access-mode trap above before changing either of these.
+  ingestion_access_mode = "Open"
+  query_access_mode     = "Open"
+
+  tags = {
+    purpose = "private-azure-monitor"
+  }
+}
+
+# Puts the workspace inside the scope. Without this the private endpoint
+# resolves nothing useful — the scope is an empty container.
+resource "azurerm_monitor_private_link_scoped_service" "law" {
+  count = var.container_log_export_enabled ? 1 : 0
+
+  name                = "amplss-law-tokenfactory"
+  resource_group_name = azurerm_resource_group.rg.name
+  scope_name          = azurerm_monitor_private_link_scope.ampls.name
+  linked_resource_id  = azurerm_log_analytics_workspace.main[0].id
+}
+
+# ── Private DNS ─────────────────────────────────────────────────────────────
+# Azure Monitor is not one endpoint but several, each with its own zone. All
+# four are required: miss one and the agent fails on whichever call lands in
+# it, usually with a timeout rather than a name-resolution error.
+#
+#   monitor.azure.com              the control plane and the DCE/ingestion path
+#   oms.opinsights.azure.com       workspace onboarding
+#   ods.opinsights.azure.com       the legacy ingestion endpoint
+#   agentsvc.azure-automation.net  agent service
+#
+# A fifth, privatelink.blob.core.windows.net, is ALSO required — the agent
+# downloads configuration and solution packs from blob storage. It already
+# exists in storage_pe.tf and is reused below rather than redeclared.
+locals {
+  ampls_dns_zones = {
+    monitor  = "privatelink.monitor.azure.com"
+    oms      = "privatelink.oms.opinsights.azure.com"
+    ods      = "privatelink.ods.opinsights.azure.com"
+    agentsvc = "privatelink.agentsvc.azure-automation.net"
+  }
+}
+
+resource "azurerm_private_dns_zone" "ampls" {
+  for_each = local.ampls_dns_zones
+
+  name                = each.value
+  resource_group_name = azurerm_resource_group.rg.name
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "ampls" {
+  for_each = local.ampls_dns_zones
+
+  name                  = "${each.key}-dns-link"
+  resource_group_name   = azurerm_resource_group.rg.name
+  private_dns_zone_name = azurerm_private_dns_zone.ampls[each.key].name
+  virtual_network_id    = azurerm_virtual_network.vnet.id
+}
+
+# ── The private endpoint ────────────────────────────────────────────────────
+# One endpoint serves the whole scope — every workspace linked into the AMPLS
+# resolves through it, so adding another later needs a scoped_service, not
+# another endpoint.
+#
+# snet-pe is a /24 with 7 addresses in use, so there is room. The endpoint
+# takes SEVERAL private IPs, one per Azure Monitor sub-resource, not one.
+resource "azurerm_private_endpoint" "ampls" {
+  name                = "pe-ampls-tokenfactory"
+  location            = var.location
+  resource_group_name = azurerm_resource_group.rg.name
+  subnet_id           = azurerm_subnet.this["snet-pe"].id
+
+  private_service_connection {
+    name                           = "ampls-privateserviceconnection"
+    private_connection_resource_id = azurerm_monitor_private_link_scope.ampls.id
+    subresource_names              = ["azuremonitor"]
+    is_manual_connection           = false
+  }
+
+  private_dns_zone_group {
+    name = "ampls-dns-zone-group"
+    private_dns_zone_ids = concat(
+      [for z in azurerm_private_dns_zone.ampls : z.id],
+      [azurerm_private_dns_zone.blob.id],
+    )
+  }
+
+  tags = {
+    pe = "tokenfactory"
+  }
+}
+
+# ── Step 2 ──────────────────────────────────────────────────────────────────
+# Once `nslookup <workspace-id>.ods.opinsights.azure.com` from inside the VNet
+# returns a 10.40.3.x address, set monitor_private_only = true in
+# terraform.tfvars and apply again. That flips the workspace's two public
+# access flags, which live on azurerm_log_analytics_workspace.main in
+# logging.tf.
+#
+# Verify after the flip by watching IncomingMessages on am-containerlogv2 for
+# thirty minutes. If it goes to zero, the agent has lost its ingestion path:
+# set the variable back to false and apply to restore it while the DNS is
+# investigated.
+#
+# nsg-pe allows inbound from snet-aks and snet-mgmt already, so the agent and
+# the jumphost both reach this endpoint without a new rule. The collectors are
+# NOT granted access and do not need it.
