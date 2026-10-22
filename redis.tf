@@ -53,14 +53,14 @@ locals {
   # and minimumTlsVersion all exist there.
   redis_api_version = "2025-04-01"
 
-  # DATABASE 2025-07-01 pe: clusteringPolicy = "NoCluster" 2025-04-01 ke enum
-  # enum at all (that version has only EnterpriseCluster | OSSCluster). ARM
+  # DATABASE on 2025-07-01: clusteringPolicy = "NoCluster" is not in the
+  # 2025-04-01 enum at all (that version has only EnterpriseCluster | OSSCluster). ARM
   # rejected the PUT outright:
   #   RESPONSE 400 BadRequest: "NoCluster clustering policy is not supported in
   #   API version 2025-04-01. Please set the 'api-version' parameter to a newer
   #   version."
-  # azapi 2.13.0 ke embedded schema ne NoCluster ko 2025-04-01 pe ACCEPT kar
-  # accepted NoCluster at 2025-04-01 with validation ON — the schema was wrong
+  # azapi 2.13.0's embedded schema accepted NoCluster at 2025-04-01 with
+  # validation ON — the schema was wrong
   # and ARM was right. 2025-07-01 is GA, not preview, and was verified against
   # its reference: clusteringPolicy allows EnterpriseCluster | NoCluster |
   # OSSCluster, and evictionPolicy includes NoEviction.
@@ -324,6 +324,8 @@ resource "azurerm_key_vault_secret" "redis_password" {
 # Clients connect to this hostname on port 10000 — NOT the privatelink
 # hostname, which Microsoft's troubleshooting guide explicitly warns against
 # putting in a connection string.
-output "redis_hostname" {
-  value = azapi_resource.redis_cluster.output.properties.hostName
-}
+
+
+#output "redis_hostname" {
+#  value = azapi_resource.redis_cluster.output.properties.hostName
+#}
